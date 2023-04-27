@@ -1,0 +1,242 @@
+---
+title: "Process and clean data"
+output: html_notebook
+---
+
+
+# Load libraries
+```{r}
+library(readr)
+library(dplyr)
+library(rvest) #scrape
+library(stringr) #pad
+library(clock) #under_minutes
+library(ggplot2)
+```
+
+# Scrape/download variable name table
+```{r}
+# download variable name table
+u = "https://www.transtats.bts.gov/DL_SelectFields.aspx?gnoyr_VQ=FGK&QO_fu146_anzr=b0-gvzr"
+
+css_selector = "#myTable"
+var_info_df = u %>% 
+  read_html() %>% 
+  html_element(css = css_selector) %>%
+  html_table(fill = TRUE) 
+colnames(var_info_df) = var_info_df[1,]
+var_info_df = var_info_df[-1,-3] # remove column names row and support table column
+
+# remove subheadings from table 
+subheading_ind = c(1,3,9,24,34,44,54,64,69,76,82,86)
+var_info_df = var_info_df[-subheading_ind,]
+
+# save df 
+write.csv(var_info_df, "Data/var_info_df.csv", row.names = F)
+```
+
+# Load Flight data 
+```{r}
+df = read.csv("Data/march2021.csv")
+colnames(df) = var_info_df[["Field Name"]]
+```
+
+# Preprocessing EDA
+```{r}
+# dataset structure
+str(df)
+
+# identify variables with one response - we can remove these non-meaningful variables
+colnames(df[,sapply(df, function(x) length(unique(x))) == 1]) 
+
+# explore missing values NAs and plot percentage missing for each column
+missing_df = data.frame("var_name" = colnames(df),
+                    "missing_pct" = colSums(is.na(df)) / nrow(df))
+ggplot(missing_df, aes(x=reorder(var_name,-missing_pct),y=missing_pct)) +
+  geom_bar(stat="identity",fill="blue")+
+  coord_flip()+theme_bw()
+```
+
+After doing EDA on the pre-processed data, we have identified tasks to complete during during the data cleaning:  
+
+1. correct column types for nominal, time, date, and numeric features.
+
+2. drop the columns with one response. 
+
+3. drop columns with majority missing values
+
+# Because we have so many variables, we can explore them in sections
+```{r}
+# html table contained subheadings, create subsets for each data category 
+time_df = var_info_df[1:6,]
+airline_df = var_info_df[7:20,]
+origin_df = var_info_df[21:29,]
+destination_df = var_info_df[30:38,]
+depart_df = var_info_df[39:47,]
+arrive_df = var_info_df[48:56,]
+canc_div_df = var_info_df[57:60,]
+summary_df = var_info_df[61:66,]
+delay_cause_df = var_info_df[67:71,]
+gate_return_df = var_info_df[72:74,]
+diverted_air_df = var_info_df[75:nrow(var_info_df),]
+```
+
+# clean each data subset 
+```{r}
+# create empty lists to store variables which need type change
+# we will drop all variables not stored in one of these lists
+nominal_vars = c()
+time_vars = c()
+date_vars = c()
+num_vars = c()
+```
+
+## Time Period
+```{r}
+df[, time_df[[1]]] %>% head(2)
+
+nominal_vars = c(nominal_vars, 
+                 c("Year", "Quarter", "Month", "DayofMonth", "DayOfWeek"))
+date_vars = c(date_vars, "FlightDate")
+```
+
+## Airline
+```{r}
+df[, airline_df[[1]]] %>% head(2)
+
+# to remove exact collinearity, we will not include all airline identification columns
+nominal_vars = c(nominal_vars,
+                 c("Marketing_Airline_Network", "Operating_Airline", 
+                 "Tail_Number", "Flight_Number_Operating_Airline"))
+```
+
+## Origin
+```{r}
+df[, origin_df[[1]]] %>% head(2)
+
+# to remove exact collinearity, we will not include all origin identification columns
+nominal_vars = c(nominal_vars, c("Origin", "OriginCityName", "OriginState"))
+```
+
+## Destination
+```{r}
+df[, destination_df[[1]]] %>% head(2)
+
+# to remove exact collinearity, we will not include all destination identification columns
+nominal_vars = c(nominal_vars, c("Dest", "DestCityName", "DestState"))
+```
+
+## Departure Performance
+```{r}
+df[, depart_df[[1]]] %>% head(2)
+
+# will not include DepDelayMinutes as equivalent to DepDelay: with negatives instead of zeros 
+nominal_vars = c(nominal_vars, c("DepDel15", 
+                                 "DepartureDelayGroups", "DepTimeBlk"))
+time_vars = c(time_vars, c("CRSDepTime", "DepTime", "WheelsOff"))
+num_vars = c(num_vars, c("DepDelay", "TaxiOut"))
+```
+
+## Arrival Performance
+```{r}
+df[, arrive_df[[1]]] %>% head(2)
+
+# will not include ArrDelayMinutes as equivalent to ArrDelay: with negatives instead of zeros 
+nominal_vars = c(nominal_vars, c("ArrDel15", 
+                                 "ArrivalDelayGroups", "ArrTimeBlk"))
+time_vars = c(time_vars, c("WheelsOn", "CRSArrTime", "ArrTime"))
+num_vars = c(num_vars, c("TaxiIn", "ArrDelay"))
+```
+
+## Cancellations and Diversions
+```{r}
+df[, canc_div_df[[1]]] %>% filter(Cancelled == 1)
+
+# Update cancellation code with factor labels from documentation
+df$CancellationCode = ifelse(df$CancellationCode == "A", "CarrierDelay",
+       ifelse(df$CancellationCode == "B", "WeatherDelay", 
+              ifelse(df$CancellationCode == "C", "NASDelay", 
+                     ifelse(df$CancellationCode == "D", "SecurityDelay", NA))))
+
+# recall Duplicate feature only has one response, do not include column
+nominal_vars = c(nominal_vars, 
+                 c("Cancelled", "CancellationCode", "Diverted"))
+```
+
+## Flight Summaries
+```{r}
+df[, summary_df[[1]]] %>% head(2)
+
+# recall Flights feature only has one response, do not include column
+nominal_vars = c(nominal_vars, c("DistanceGroup"))
+num_vars = c(num_vars, c("CRSElapsedTime", "ActualElapsedTime", "AirTime", "Distance"))
+```
+
+## Cause of Delay
+```{r}
+df[, delay_cause_df[[1]]] %>% na.omit() %>% head(2)
+
+num_vars = c(num_vars, c("CarrierDelay","WeatherDelay","NASDelay",
+                         "SecurityDelay","LateAircraftDelay"))
+```
+
+## Gate Return Information at Origin Airport 
+```{r}
+df[, gate_return_df[[1]]] %>% na.omit() %>% head(2)
+
+
+colSums(is.na(df[, gate_return_df[[1]]])) / nrow(df[, gate_return_df[[1]]])
+# Gate return features are missing majority of values, do not include columns
+```
+
+## Diverted Airport Information
+```{r}
+# diverted_air df
+df[, diverted_air_df[[1]]] %>% head(2)
+
+(colSums(is.na(df[, diverted_air_df[[1]]])) / nrow(df[, diverted_air_df[[1]]]))*100
+# most Diverted features are missing majority of values, do not include columns
+```
+
+# Fix column types 
+```{r}
+# create function to turn integer column into time with hour:min format
+
+fix_time_format = function(time_data) {
+  # make sure to fix time in FlightDate before running
+  helper_df = df %>% select(FlightDate, all_of(time_data))
+  pad_time = str_pad(df[, time_data], 4, pad = "0")
+  # add hour and minute columns
+  helper_df$Hour = as.numeric(substr(pad_time,start=1,stop=2))
+  helper_df$Minute = as.numeric(substr(pad_time,start=3,stop=4))
+
+  # combine date and time columns
+  formatted_time_df <- helper_df %>%
+    mutate(datetime = FlightDate %>%
+             add_hours(Hour) %>%
+             add_minutes(Minute), .keep = "unused")
+  
+  return(formatted_time_df$datetime)
+}
+```
+
+```{r}
+# correct factor variable types
+df[, "FlightDate"] = as.POSIXct(df[, "FlightDate"], format = "%m/%d/%Y %H:%M") #only date col
+df[, time_vars] = lapply(time_vars, function(x) fix_time_format(x))
+df[, nominal_vars] = lapply(nominal_vars, function(x) as.factor(df[[x]]))
+df[, num_vars] = lapply(num_vars, function(x) as.numeric(df[[x]]))
+```
+
+# Construct complete data frame 
+```{r}
+clean_df = df %>% 
+  # select variables of interest in the same order
+  select(all_of(colnames(df)[colnames(df) %in% 
+                               c(time_vars, date_vars, num_vars, nominal_vars)]))
+```
+
+# save clean data
+```{r}
+saveRDS(clean_df, file = "Data/clean_df.Rds")
+```
